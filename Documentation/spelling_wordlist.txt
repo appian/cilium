@@ -861,6 +861,8 @@ skipCRDCreation
 skipteardown
 sleepAfterInit
 snat
+socketLB
+socketLB.enabled
 socketPath
 sockmap
 sockops
