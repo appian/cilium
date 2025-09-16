@@ -4,9 +4,12 @@
 package ipam
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
+	"slices"
 
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
@@ -22,11 +25,11 @@ import (
 )
 
 type eniDeviceConfig struct {
-	name         string
-	ip           net.IP
-	cidr         *net.IPNet
-	mtu          int
-	usePrimaryIP bool
+	Name         string     `json:"name,omitempty"`
+	IP           net.IP     `json:"ip,omitempty"`
+	CIDR         *net.IPNet `json:"cidr,omitempty"`
+	MTU          int        `json:"mtu,omitempty"`
+	UsePrimaryIP bool       `json:"usePrimaryIP,omitempty"`
 }
 
 type configMap map[string]eniDeviceConfig // by MAC addr
@@ -49,6 +52,7 @@ func configureENIDevices(oldNode, newNode *ciliumv2.CiliumNode, mtuConfig MtuCon
 
 	for name, eni := range newNode.Status.ENI.ENIs {
 		if eni.IsExcludedBySpec(newNode.Spec.ENI) {
+			log.WithField("eni", eni).Info("Skipping ENI excluded by spec")
 			continue
 		}
 
@@ -64,12 +68,22 @@ func configureENIDevices(oldNode, newNode *ciliumv2.CiliumNode, mtuConfig MtuCon
 		}
 	}
 
+	existingEniJson, _ := json.Marshal(existingENIByName)
+	newNodeEniJson, _ := json.Marshal(newNode.Status.ENI.ENIs)
+	addedEniJson, _ := json.Marshal(slices.Collect(maps.Values(addedENIByMac)))
+	log.WithField("oldNodeENI", string(existingEniJson)).
+		WithField("newNodeENI", string(newNodeEniJson)).
+		WithField("addedENI", string(addedEniJson)).
+		Info("Computed added ENI")
+
 	go setupENIDevices(addedENIByMac)
 
 	return nil
 }
 
 func setupENIDevices(eniConfigByMac configMap) {
+	log.WithField("eniConfig", eniConfigByMac).
+		Info("Setting up ENIs")
 	// Wait for the interfaces to be attached to the local node
 	eniLinkByMac, err := waitForNetlinkDevices(eniConfigByMac)
 	if err != nil {
@@ -79,7 +93,7 @@ func setupENIDevices(eniConfigByMac configMap) {
 		}
 		requiredENIByMac := make(map[string]string, len(eniConfigByMac))
 		for mac, eni := range eniConfigByMac {
-			requiredENIByMac[mac] = eni.name
+			requiredENIByMac[mac] = eni.Name
 		}
 
 		log.WithError(err).WithFields(logrus.Fields{
@@ -95,15 +109,18 @@ func setupENIDevices(eniConfigByMac configMap) {
 			log.WithField(logfields.MACAddr, mac).Warning("No configuration found for ENI device")
 			continue
 		}
+
 		err = configureENINetlinkDevice(link, cfg)
 		if err != nil {
 			log.WithError(err).
 				WithFields(logrus.Fields{
 					logfields.MACAddr:  mac,
-					logfields.Resource: cfg.name,
+					logfields.Resource: cfg.Name,
 				}).
 				Error("Failed to configure ENI device")
 		}
+		cfgJson, _ := json.Marshal(cfg)
+		log.WithField("eniConfig", string(cfgJson)).Info("Configured eni device")
 	}
 }
 
@@ -118,13 +135,15 @@ func parseENIConfig(name string, eni *eniTypes.ENI, mtuConfig MtuConfiguration, 
 		return cfg, fmt.Errorf("failed to parse eni subnet cidr %q: %w", eni.Subnet.CIDR, err)
 	}
 
-	return eniDeviceConfig{
-		name:         name,
-		ip:           ip,
-		cidr:         cidr,
-		mtu:          mtuConfig.GetDeviceMTU(),
-		usePrimaryIP: usePrimary,
-	}, nil
+	cfg = eniDeviceConfig{
+		Name:         name,
+		IP:           ip,
+		CIDR:         cidr,
+		MTU:          mtuConfig.GetDeviceMTU(),
+		UsePrimaryIP: usePrimary,
+	}
+
+	return cfg, nil
 }
 
 const (
@@ -166,8 +185,8 @@ func waitForNetlinkDevices(configByMac configMap) (linkByMac linkMap, err error)
 }
 
 func configureENINetlinkDevice(link netlink.Link, cfg eniDeviceConfig) error {
-	if err := netlink.LinkSetMTU(link, cfg.mtu); err != nil {
-		return fmt.Errorf("failed to change MTU of link %s to %d: %w", link.Attrs().Name, cfg.mtu, err)
+	if err := netlink.LinkSetMTU(link, cfg.MTU); err != nil {
+		return fmt.Errorf("failed to change MTU of link %s to %d: %w", link.Attrs().Name, cfg.MTU, err)
 	}
 
 	if err := netlink.LinkSetUp(link); err != nil {
@@ -175,28 +194,28 @@ func configureENINetlinkDevice(link netlink.Link, cfg eniDeviceConfig) error {
 	}
 
 	// Set the primary IP in order for SNAT to work correctly on this ENI
-	if !cfg.usePrimaryIP {
+	if !cfg.UsePrimaryIP {
 		err := netlink.AddrAdd(link, &netlink.Addr{
 			IPNet: &net.IPNet{
-				IP:   cfg.ip,
-				Mask: cfg.cidr.Mask,
+				IP:   cfg.IP,
+				Mask: cfg.CIDR.Mask,
 			},
 		})
 		if err != nil && !errors.Is(err, unix.EEXIST) {
-			return fmt.Errorf("failed to set eni primary ip address %q on link %q: %w", cfg.ip, link.Attrs().Name, err)
+			return fmt.Errorf("failed to set eni primary ip address %q on link %q: %w", cfg.IP, link.Attrs().Name, err)
 		}
 
 		// Remove the default route for this ENI, as it can overlap with the
 		// default route of the primary ENI and therefore break node connectivity
 		err = netlink.RouteDel(&netlink.Route{
-			Dst:   cfg.cidr,
-			Src:   cfg.ip,
+			Dst:   cfg.CIDR,
+			Src:   cfg.IP,
 			Table: unix.RT_TABLE_MAIN,
 			Scope: netlink.SCOPE_LINK,
 		})
 		if err != nil && !errors.Is(err, unix.ESRCH) {
 			// We ignore ESRCH, as it means the entry was already deleted
-			return fmt.Errorf("failed to delete default route %q on link %q: %w", cfg.ip, link.Attrs().Name, err)
+			return fmt.Errorf("failed to delete default route %q on link %q: %w", cfg.IP, link.Attrs().Name, err)
 		}
 	}
 

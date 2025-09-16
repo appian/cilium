@@ -5,6 +5,7 @@ package ipam
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -133,6 +134,11 @@ func newNodeStore(nodeName string, conf *option.DaemonConfig, owner Owner, local
 						valid = true
 						newNode = newNode.DeepCopy()
 						if oldNode.DeepEqual(newNode) {
+							newEnisJson, _ := json.Marshal(newNode.Status.ENI.ENIs)
+							oldEnisJson, _ := json.Marshal(oldNode.Status.ENI.ENIs)
+							log.WithField("oldEnis", string(oldEnisJson)).
+								WithField("newEnis", string(newEnisJson)).
+								Info("Skipping CiliumNode update")
 							// The UpdateStatus call in refreshNode requires an up-to-date
 							// CiliumNode.ObjectMeta.ResourceVersion. Therefore, we store the most
 							// recent version here even if the nodes are equal, because
@@ -351,6 +357,12 @@ func validateENIConfig(node *ciliumv2.CiliumNode) error {
 	}
 
 	// Check if all pool resource IPs are present in the status
+	eniJson, _ := json.Marshal(node.Status.ENI.ENIs)
+	poolJson, _ := json.Marshal(node.Spec.IPAM.Pool)
+	log.WithField("enis", string(eniJson)).
+		WithField("nodeSpecIPAMPool", string(poolJson)).
+		Info("Validating CiliumNode")
+
 	eniIPMap := map[string][]string{}
 	for k, v := range node.Spec.IPAM.Pool {
 		eniIPMap[v.Resource] = append(eniIPMap[v.Resource], k)
