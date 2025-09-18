@@ -514,8 +514,16 @@ func (n *nodeStore) updateLocalNodeResource(node *ciliumv2.CiliumNode) {
 // its resourceVersion) without updating the available IP pool.
 func (n *nodeStore) setOwnNodeWithoutPoolUpdate(node *ciliumv2.CiliumNode) {
 	n.mutex.Lock()
+	defer n.mutex.Unlock()
+
+	if n.conf.IPAMMode() == ipamOption.IPAMENI {
+		if err := validateENIConfig(node); err != nil {
+			log.WithError(err).Info("ENI state is not consistent yet, not updating ownNode")
+			return
+		}
+	}
+
 	n.ownNode = node
-	n.mutex.Unlock()
 }
 
 // refreshNodeTrigger is called to refresh the custom resource after taking the
